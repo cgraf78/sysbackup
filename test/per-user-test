@@ -1,0 +1,102 @@
+#!/bin/bash
+# Exercise ordinary-user backup state with fake account lookup and Restic.
+set -u
+
+if ((EUID == 0)); then
+  printf 'SKIP: run this suite as an ordinary user\n'
+  exit 0
+fi
+repoDir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
+T=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$T"' EXIT
+mkdir -m 0700 "$T/bin" "$T/home-a" "$T/home-b"
+cat >"$T/bin/getent" <<'GETENT'
+#!/bin/bash
+[[ $1 == passwd && $2 == "$TEST_UID" ]] || exit 1
+printf 'fixture:x:%s:%s::%s:/bin/bash\n' "$TEST_UID" "$TEST_GID" "$TEST_HOME"
+GETENT
+cat >"$T/bin/restic" <<'RESTIC'
+#!/bin/bash
+[[ $HOME == "$TEST_HOME" ]] || exit 4
+printf '%s\n' "$1" >>"$TEST_CALLS"
+if [[ $1 == snapshots ]]; then printf '[]\n'; fi
+RESTIC
+chmod 755 "$T/bin/getent" "$T/bin/restic"
+ln -s "$repoDir/bin/sysbackup" "$T/bin/sysbackup"
+TEST_GID=$(id -g) || exit 1
+export TEST_UID=$EUID TEST_GID TEST_CALLS=$T/calls
+export PATH="$T/bin:$PATH" HOME="$T/wrong-home"
+[[ $(type -P restic) == "$T/bin/restic" ]] || exit 1
+fails=0
+
+check() {
+  local name=$1
+  shift
+  if "$@"; then printf 'PASS %s\n' "$name"; else
+    printf 'FAIL %s\n' "$name"
+    fails=$((fails + 1))
+  fi
+}
+
+configure() {
+  local user_home=$1
+  mkdir -p "$user_home/.config/sysbackup"
+  chmod 0700 "$user_home/.config/sysbackup"
+  cat >"$user_home/.config/sysbackup/sysbackup.conf" <<CONF
+[global]
+INCLUDES="$T/input"
+[repo0]
+REPO="$T/repository"
+CONF
+  : >"$user_home/.config/sysbackup/sysbackup.env"
+  chmod 0600 "$user_home/.config/sysbackup/sysbackup.conf" \
+    "$user_home/.config/sysbackup/sysbackup.env"
+}
+
+export TEST_HOME=$T/home-a
+configure "$TEST_HOME"
+bash "$T/bin/sysbackup" backup >"$T/out" 2>&1
+rc=$?
+check 'symlinked command finds its parser and backs up' test "$rc" -eq 0
+check 'marker belongs to the effective user home' test \
+  "$(cat "$TEST_HOME/.local/state/sysbackup/last-success")" = repo0
+check 'marker uses private state directory' test \
+  "$(stat -c %a "$TEST_HOME/.local/state/sysbackup")" = 700
+check 'fake Restic ran the full sequence' test \
+  "$(tr '\n' ' ' <"$TEST_CALLS")" = 'snapshots backup forget prune '
+check 'caller HOME is not used' test ! -e "$HOME/.local/state/sysbackup/last-success"
+
+export TEST_HOME=$T/home-b
+: >"$TEST_CALLS"
+bash "$repoDir/bin/sysbackup" backup >"$T/out" 2>&1
+rc=$?
+check 'another account home needs its own config' test "$rc" -ne 0
+check 'missing config never calls Restic' test ! -s "$TEST_CALLS"
+configure "$TEST_HOME"
+bash "$repoDir/bin/sysbackup" backup >"$T/out" 2>&1
+rc=$?
+check 'second account home gets its own marker' test "$rc" -eq 0
+check 'first account marker remains' test -f "$T/home-a/.local/state/sysbackup/last-success"
+
+mkdir -m 0777 "$T/unsafe-parent"
+mkdir -m 0700 "$T/unsafe-parent/home"
+export TEST_HOME=$T/unsafe-parent/home
+configure "$TEST_HOME"
+: >"$TEST_CALLS"
+bash "$repoDir/bin/sysbackup" backup >"$T/out" 2>&1
+rc=$?
+check 'writable account-home ancestor is refused' test "$rc" -ne 0
+check 'unsafe account-home ancestor never calls Restic' test ! -s "$TEST_CALLS"
+
+export TEST_HOME=$T/home-a
+mkdir -p "$T/unsafe-parent/repo/bin" "$T/unsafe-parent/repo/lib/sysbackup"
+cp "$repoDir/bin/sysbackup" "$T/unsafe-parent/repo/bin/"
+cp "$repoDir/lib/sysbackup/config-parser" "$T/unsafe-parent/repo/lib/sysbackup/"
+: >"$TEST_CALLS"
+bash "$T/unsafe-parent/repo/bin/sysbackup" backup >"$T/out" 2>&1
+rc=$?
+check 'writable checkout ancestor is refused' test "$rc" -ne 0
+check 'unsafe checkout ancestor never calls Restic' test ! -s "$TEST_CALLS"
+
+printf '\nResults: %d failed\n' "$fails"
+exit "$((fails != 0))"

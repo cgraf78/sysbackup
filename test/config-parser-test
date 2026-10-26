@@ -14,7 +14,7 @@ rejects_config() {
 
 # This source file is owned by sysbackup. The test deliberately reads no
 # installed configuration or credentials.
-source "$repoDir/config-parser"
+source "$repoDir/lib/sysbackup/config-parser"
 
 check() {
   local name=$1

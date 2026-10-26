@@ -39,20 +39,24 @@ jobs:
           # This sourced template intentionally has no executable shebang, so
           # lint it explicitly outside the shell-program inventory.
           shellcheck -s bash examples/sysbackup.env
-          bash -n sysbackup install config-parser examples/sysbackup.env test/lib.sh test/*-test
+          bash -n bin/sysbackup install lib/sysbackup/config-parser examples/sysbackup.env test/lib.sh test/*-test
 
       - name: Test configuration parser
         shell: bash
         run: bash test/config-parser-test
 
-      - name: Test backup and installer in isolated mount namespaces
+      - name: Test standalone install and ordinary-user backup
         shell: bash
         run: |-
           set -euo pipefail
-          # The harness refuses to create a host path before mounting tmpfs.
-          # This directory is created only on the disposable CI runner.
-          sudo -n install -d -o root -g root -m 0755 /etc/sysbackup
-          for suite in parent-snapshot-test success-marker-test install-test mount-test; do
+          bash test/install-test
+          bash test/per-user-test
+
+      - name: Test backup in isolated mount namespaces
+        shell: bash
+        run: |-
+          set -euo pipefail
+          for suite in parent-snapshot-test success-marker-test mount-test; do
             sudo -n bash "test/$suite"
           done
 

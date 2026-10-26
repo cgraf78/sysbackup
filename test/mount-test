@@ -1,14 +1,14 @@
 #!/bin/bash
 # Mount paths are invocation-owned and are removed after Restic returns or
-# fails. /mnt is overlaid by the shared private mount-namespace harness.
-# shellcheck source=lib.sh disable=SC1091
+# fails. The user's state directory is overlaid by the shared private harness.
+# shellcheck source=lib.sh disable=SC1091,SC2154
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 declare -r location='sftp:example:/nested/backup'
 
 # These predicates are passed to the shared check helper by name.
 # shellcheck disable=SC2329
-no_mountpoints() { [ -z "$(ls -A /mnt)" ]; }
+no_mountpoints() { [ -z "$(compgen -G "$stateDir/mount.*")" ]; }
 # shellcheck disable=SC2329
 private_mount() {
   local arg

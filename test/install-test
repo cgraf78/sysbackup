@@ -1,18 +1,20 @@
 #!/bin/bash
-# The copied recipe points only into /run, so these root installer tests cannot
-# replace /usr/bin/sysbackup or live /etc/sysbackup configuration.
+# A fake account lookup confines standalone installation to a temporary home.
 set -u
 
-[ "$EUID" -eq 0 ] || {
-  echo "Error: must run as root" >&2
-  exit 1
-}
 repoDir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
-T=$(mktemp -d /run/sysbackup-install-test.XXXXXX) || exit 1
+T=$(mktemp -d) || exit 1
 trap 'rm -rf -- "$T"' EXIT
-cp "$repoDir/install" "$T/install"
-printf 'new program\n' >"$T/program"
-printf 'example secret\n' >"$T/environment"
+mkdir -m 0700 "$T/home" "$T/bin"
+cat >"$T/bin/getent" <<'GETENT'
+#!/bin/bash
+[[ $1 == passwd && $2 == "$TEST_UID" ]] || exit 1
+printf 'fixture:x:%s:%s::%s:/bin/bash\n' "$TEST_UID" "$TEST_GID" "$TEST_HOME"
+GETENT
+chmod 755 "$T/bin/getent"
+TEST_GID=$(id -g) || exit 1
+export TEST_UID=$EUID TEST_GID TEST_HOME=$T/home
+export PATH="$T/bin:$PATH"
 fails=0
 
 check() {
@@ -20,71 +22,80 @@ check() {
   shift
   if "$@"; then echo "PASS $name"; else
     echo "FAIL $name"
-    sed 's/^/    /' "$T/out"
     fails=$((fails + 1))
   fi
 }
 
-# The synthetic recipes below exercise installer behavior. Also verify the
-# shipped recipe itself, since a moved template can otherwise go unnoticed.
-while IFS=: read -r source_file _; do
-  [ -n "$source_file" ] && [[ $source_file != \#* ]] || continue
-  check "shipped source exists: $source_file" test -f "$repoDir/$source_file"
-done <"$repoDir/install.recipe"
-
-recipe() {
-  printf '%s\n' "program:$T/bin:755" "environment:$T/etc:600:nooverwrite" >"$T/install.recipe"
-}
-run_install() { bash "$T/install" >"$T/out" 2>&1; }
-
-recipe
-(
-  umask 000
-  run_install
-)
-check "installs files with final ownership and mode" \
-  test "$(stat -c '%u:%a' "$T/bin/program") $(stat -c '%u:%a' "$T/etc/environment")" = "0:755 0:600"
-check "fresh destination directories stay root-owned and non-writable" \
-  test "$(stat -c '%u:%a' "$T/bin") $(stat -c '%u:%a' "$T/etc")" = "0:755 0:755"
-
-printf 'kept\n' >"$T/etc/environment"
-run_install
-check "nooverwrite preserves existing contents" test "$(cat "$T/etc/environment")" = kept
-
-rm "$T/etc/environment"
-printf 'victim\n' >"$T/victim"
-ln -s "$T/victim" "$T/etc/environment"
-run_install
+bash "$repoDir/install" >"$T/out" 2>&1
 rc=$?
-check "rejects a destination symlink" test "$rc" -ne 0
-check "does not modify the symlink target" test "$(cat "$T/victim")" = victim
+check 'standalone install succeeds' test "$rc" -eq 0
+check 'command links to the checkout' test \
+  "$(readlink "$T/home/.local/bin/sysbackup")" = "$repoDir/bin/sysbackup"
+check 'config templates are private' test \
+  "$(stat -c %a "$T/home/.config/sysbackup/sysbackup.conf") $(stat -c %a "$T/home/.config/sysbackup/sysbackup.env")" = '600 600'
 
-rm "$T/etc/environment"
-chmod 777 "$T/etc"
-run_install
+printf 'local setting\n' >"$T/home/.config/sysbackup/sysbackup.conf"
+bash "$repoDir/install" >"$T/out" 2>&1
+check 'existing configuration is preserved' test \
+  "$(cat "$T/home/.config/sysbackup/sysbackup.conf")" = 'local setting'
+
+ln -s "$T/victim" "$T/home/.config/sysbackup/sysbackup.env.next"
+mv "$T/home/.config/sysbackup/sysbackup.env" "$T/home/.config/sysbackup/sysbackup.env.saved"
+mv "$T/home/.config/sysbackup/sysbackup.env.next" "$T/home/.config/sysbackup/sysbackup.env"
+bash "$repoDir/install" >"$T/out" 2>&1
 rc=$?
-check "rejects a writable config directory" test "$rc" -ne 0
-chmod 755 "$T/etc"
+check 'symlinked credentials are refused' test "$rc" -ne 0
+check 'symlink target is untouched' test ! -e "$T/victim"
 
-mkdir "$T/etc/environment"
-run_install
+rm -- "$T/home/.config/sysbackup/sysbackup.env"
+mv "$T/home/.config/sysbackup/sysbackup.env.saved" \
+  "$T/home/.config/sysbackup/sysbackup.env"
+rm -- "$T/home/.local/bin/sysbackup"
+printf 'locally owned command\n' >"$T/home/.local/bin/sysbackup"
+bash "$repoDir/install" >"$T/out" 2>&1
 rc=$?
-check "rejects a destination directory" test "$rc" -ne 0
+check 'regular command is never replaced' test "$rc" -ne 0
+check 'regular command contents are preserved' test \
+  "$(cat "$T/home/.local/bin/sysbackup")" = 'locally owned command'
 
-rm -rf "$T/etc/environment"
-printf 'old program\n' >"$T/bin/program"
-printf '%s\n' "program:$T/bin:755" "missing:$T/etc:600:nooverwrite" >"$T/install.recipe"
-run_install
+mkdir -m 0700 "$T/home-invalid"
+mkdir -p "$T/home-invalid/.config/sysbackup"
+ln -s "$T/victim" "$T/home-invalid/.config/sysbackup/sysbackup.env"
+export TEST_HOME=$T/home-invalid
+bash "$repoDir/install" >"$T/out" 2>&1
 rc=$?
-check "missing late source fails before install" test "$rc" -ne 0
-check "missing late source leaves prior executable" test "$(cat "$T/bin/program")" = 'old program'
+check 'late invalid env fails before linking' test "$rc" -ne 0
+check 'late invalid env leaves no command or config' test \
+  ! -e "$TEST_HOME/.local/bin/sysbackup"
+check 'late invalid env leaves no new config' test \
+  ! -e "$TEST_HOME/.config/sysbackup/sysbackup.conf"
 
-rm -rf "$T/etc/environment"
-mkdir "$T/examples"
-printf 'nested template\n' >"$T/examples/environment"
-printf '%s\n' "examples/environment:$T/etc:600:nooverwrite" >"$T/install.recipe"
-run_install
-check "nested template installs under its basename" test "$(cat "$T/etc/environment")" = 'nested template'
+mkdir -m 0700 "$T/home-missing"
+mkdir -p "$T/incomplete/bin" "$T/incomplete/lib/sysbackup" "$T/incomplete/examples"
+cp "$repoDir/install" "$T/incomplete/install"
+cp "$repoDir/bin/sysbackup" "$T/incomplete/bin/sysbackup"
+cp "$repoDir/lib/sysbackup/config-parser" "$T/incomplete/lib/sysbackup/config-parser"
+cp "$repoDir/examples/sysbackup.conf" "$T/incomplete/examples/sysbackup.conf"
+export TEST_HOME=$T/home-missing
+bash "$T/incomplete/install" >"$T/out" 2>&1
+rc=$?
+check 'missing late template fails before linking' test "$rc" -ne 0
+check 'missing late template leaves no command' test \
+  ! -e "$TEST_HOME/.local/bin/sysbackup"
+check 'missing late template leaves no config' test \
+  ! -e "$TEST_HOME/.config/sysbackup/sysbackup.conf"
 
-if [ "$fails" -eq 0 ]; then echo "All tests passed"; else echo "$fails test(s) failed"; fi
+mkdir -m 0700 "$T/home-unsafe-template"
+cp "$repoDir/examples/sysbackup.env" "$T/incomplete/examples/sysbackup.env"
+chmod 0666 "$T/incomplete/examples/sysbackup.env"
+export TEST_HOME=$T/home-unsafe-template
+bash "$T/incomplete/install" >"$T/out" 2>&1
+rc=$?
+check 'writable credentials template is refused' test "$rc" -ne 0
+check 'writable credentials template leaves no command' test \
+  ! -e "$TEST_HOME/.local/bin/sysbackup"
+check 'writable credentials template leaves no config' test \
+  ! -e "$TEST_HOME/.config/sysbackup/sysbackup.conf"
+
+printf '\nResults: %d failed\n' "$fails"
 exit "$((fails != 0))"

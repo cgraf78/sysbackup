@@ -3,9 +3,9 @@
 # lib.sh - Shared harness for the sysbackup tests.
 #
 # A test sources this file first. The harness re-execs the test inside a
-# private mount namespace and mounts tmpfs over /etc/sysbackup, /var/lib,
-# /mnt, and the directory /var/lock resolves to, then puts a fake restic
-# first on PATH.
+# private mount namespace and mounts tmpfs over the effective user's home
+# and /var/lib (which only holds the fake restic), then puts that fake first
+# on PATH.
 # The script under test therefore sees only throwaway config, state, and
 # locks, and the host's real ones are never read or written.
 #
@@ -54,28 +54,29 @@ fi
 
 T=$(mktemp -d /run/sysbackup-test.XXXXXX) || exit 1
 trap 'rm -rf "$T"' EXIT
-cp "$repoDir/sysbackup" "$repoDir/config-parser" "$T/"
+mkdir -p "$T/bin" "$T/lib/sysbackup"
+cp "$repoDir/bin/sysbackup" "$T/bin/"
+cp "$repoDir/lib/sysbackup/config-parser" "$T/lib/sysbackup/"
 
-# sysbackup locks under /var/lock/sysbackup; cover wherever /var/lock resolves.
 # Every mount point must already exist: a mount namespace does not isolate
 # directory contents, so creating one here would change the real filesystem.
-lockDir=$(readlink -f /var/lock) || exit 1
-declare -r lockDir
+accountHome=$(getent passwd "$EUID" | cut -d: -f6) || exit 1
+declare -r accountHome
 in_private_ns || exit 1
-for dir in /etc/sysbackup /var/lib /mnt "$lockDir"; do
+for dir in "$accountHome" /var/lib; do
   if [ ! -d "$dir" ]; then
     echo "Error: $dir must exist to mount over it" >&2
     exit 1
   fi
   mount -t tmpfs sysbackup-test "$dir" || exit 1
 done
-chmod 755 /etc/sysbackup
-# Match systems whose /run/lock is a root-owned sticky world-writable dir.
-chmod 1777 "$lockDir"
-
-cp "$T/config-parser" /etc/sysbackup/
-: >/etc/sysbackup/sysbackup.env
-chmod 600 /etc/sysbackup/sysbackup.env
+chmod 0700 "$accountHome"
+mkdir -p "$accountHome/.config/sysbackup" "$accountHome/.local/state"
+chmod 700 "$accountHome/.config/sysbackup"
+umask 077
+: >"$accountHome/.config/sysbackup/sysbackup.env"
+declare -r confDir="$accountHome/.config/sysbackup"
+declare -r stateDir="$accountHome/.local/state/sysbackup"
 
 # The fake restic lives on the /var/lib tmpfs, not in $T: /run is noexec on
 # some hosts, and bash's PATH search skips a file it cannot execute and falls
@@ -130,7 +131,7 @@ fi
 fails=0
 
 # config SECTION... - Writes sysbackup.conf from raw INI lines.
-config() { printf '%s\n' "$@" >/etc/sysbackup/sysbackup.conf; }
+config() { printf '%s\n' "$@" >"$confDir/sysbackup.conf"; }
 
 # two_repos - The usual layout: a local repo r0 and an offsite repo r1.
 two_repos() {
@@ -139,7 +140,7 @@ two_repos() {
 
 # reset - Clears state between cases.
 reset() {
-  rm -rf /var/lib/sysbackup
+  rm -rf "$stateDir"
   : >"$CALLS"
   : >"$PARENTS"
   : >"$ARGS"
@@ -148,7 +149,7 @@ reset() {
 
 # run FAIL_SPEC ARGS... - Runs sysbackup with the fake restic failing on
 # FAIL_SPEC. Runs through bash so a noexec /run cannot fail every case.
-run() { FAIL=$1 bash "$T/sysbackup" "${@:2}" >"$T/out" 2>&1; }
+run() { FAIL=$1 bash "$T/bin/sysbackup" "${@:2}" >"$T/out" 2>&1; }
 
 pass() { echo "PASS $1"; }
 fail() {
@@ -167,8 +168,8 @@ check() {
 # hold_lock / release_lock - Hold sysbackup's own lock, as a running backup
 # would.
 hold_lock() {
-  [ -d "$lockDir/sysbackup" ] || mkdir -m 0700 "$lockDir/sysbackup"
-  exec 98>"$lockDir/sysbackup/sysbackup.lock"
+  [ -d "$stateDir" ] || mkdir -m 0700 "$stateDir"
+  exec 98>"$stateDir/sysbackup.lock"
   flock -x 98
 }
 release_lock() {
