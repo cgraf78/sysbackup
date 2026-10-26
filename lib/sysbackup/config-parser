@@ -43,7 +43,7 @@ cfg_apply() {
     [[ $entry =~ ^([[:alpha:]_][[:alnum:]_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || return 1
     key=${BASH_REMATCH[1]}
     value=${BASH_REMATCH[2]}
-    # Values are shell-style word lists in the trusted root-owned config.
+    # Values are shell-style word lists in the trusted user-owned config.
     # Evaluate only after the caller has checked its owner and permissions.
     eval "$key=($value)" || return 1
   done <<<"${cfg_lines[$section]}"

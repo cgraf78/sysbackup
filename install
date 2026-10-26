@@ -1,68 +1,101 @@
 #!/bin/bash
-set -e
-
-scriptDir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
-recipeFile="$scriptDir/install.recipe"
+# Install a checkout-backed command for the effective user. This is independent
+# of any dependency manager; the checkout must remain at its current path.
+set -euo pipefail
+umask 077
 
 error() {
-  echo "Error: $1" >&2
+  printf 'sysbackup install: %s\n' "$*" >&2
   exit 1
 }
 
-[ "$EUID" -eq 0 ] || error "This script must be run as root"
-[ -f "$recipeFile" ] || error "No install recipe ($recipeFile)"
+checkout=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+[[ -f $checkout/bin/sysbackup && -x $checkout/bin/sysbackup &&
+  -f $checkout/lib/sysbackup/config-parser ]] || error 'incomplete checkout'
 
-sources=() targets=() modes=() options=()
-while IFS= read -r line || [ -n "$line" ]; do
-  line=${line%%#*}
-  [ -n "${line//[[:space:]]/}" ] || continue
-  IFS=: read -r src dst mode option extra <<<"$line"
-  [ -n "$src" ] && [[ "$dst" = /* ]] && [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ -z "$extra" ] || error "Invalid recipe entry"
-  [ -z "$option" ] || [ "$option" = nooverwrite ] || error "Unknown recipe option"
+account_entry=$(getent passwd "$EUID") || error 'cannot resolve the effective user'
+IFS=: read -r _ _ account_uid _ _ account_home _ <<<"$account_entry"
+[[ $account_uid == "$EUID" && $account_home == /* && $account_home != / ]] ||
+  error 'unsafe account home'
 
-  sourceFile="$scriptDir/$src"
-  target="$dst/$(basename "$src")"
-  [ -f "$sourceFile" ] && [ ! -L "$sourceFile" ] || error "Missing or unsafe source: $sourceFile"
-  if [ -e "$dst" ] || [ -L "$dst" ]; then
-    [ -d "$dst" ] && [ ! -L "$dst" ] || error "Unsafe destination directory: $dst"
-    dirOwner=$(stat -c %u -- "$dst") || error "Cannot stat $dst"
-    dirMode=$(stat -c %a -- "$dst") || error "Cannot stat $dst"
-    if [ "$dirOwner" != 0 ] || (((8#$dirMode & 0022) != 0)); then
-      error "Unsafe destination directory: $dst"
-    fi
+trusted_source() {
+  local source_file=$1 owner mode
+  [[ -f $source_file && ! -L $source_file ]] || error "unsafe source: $source_file"
+  owner=$(stat -c %u -- "$source_file") || error "cannot stat $source_file"
+  mode=$(stat -c %a -- "$source_file") || error "cannot stat $source_file"
+  if [[ $owner != "$EUID" ]] || (((8#$mode & 0022) != 0)); then
+    error "unsafe source ownership or mode: $source_file"
   fi
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    [ -f "$target" ] && [ ! -L "$target" ] || error "Unsafe destination file: $target"
-  fi
-  sources+=("$sourceFile") targets+=("$target") modes+=("$mode") options+=("$option")
-done <"$recipeFile"
-
-# Finish validation before replacing any installed file. A missing late
-# template must not leave a half-upgraded executable and parser behind.
-[ "${#sources[@]}" -gt 0 ] || error "Empty install recipe"
-
-# New directory components must not inherit a permissive caller umask.
-umask 022
-
-tempFile=
-cleanup() {
-  if [ -n "$tempFile" ]; then rm -f -- "$tempFile"; fi
 }
-trap cleanup EXIT
 
-for i in "${!sources[@]}"; do
-  target=${targets[i]}
-  if [ "${options[i]}" = nooverwrite ] && [ -e "$target" ]; then
-    chown root:root -- "$target"
-    chmod "${modes[i]}" -- "$target"
-    continue
+# A writable ancestor can swap a trusted template between preflight and copy.
+# Sticky shared roots such as /tmp are safe when their child is account-owned.
+current=$checkout
+while :; do
+  [[ -d $current && ! -L $current ]] || error "unsafe source directory: $current"
+  owner=$(stat -c %u -- "$current") || error "cannot stat $current"
+  mode=$(stat -c %a -- "$current") || error "cannot stat $current"
+  [[ $owner == 0 || $owner == "$EUID" ]] || error "untrusted source directory: $current"
+  if (((8#$mode & 0022) != 0 && (8#$mode & 01000) == 0)); then
+    error "writable source directory: $current"
   fi
-
-  mkdir -p -- "$(dirname "$target")"
-  # mktemp starts mode 0600, so a credential template is never briefly
-  # readable under a permissive caller umask. Rename replaces atomically.
-  tempFile=$(mktemp "$(dirname "$target")/.sysbackup-install.XXXXXXXX")
-  install -o root -g root -m "${modes[i]}" -- "${sources[i]}" "$tempFile"
-  mv -fT -- "$tempFile" "$target"
-  tempFile=
+  [[ $current == / ]] && break
+  current=${current%/*}
+  [[ -n $current ]] || current=/
 done
+for directory in "$checkout/bin" "$checkout/lib" \
+  "$checkout/lib/sysbackup" "$checkout/examples"; do
+  [[ -d $directory && ! -L $directory ]] || error "unsafe source directory: $directory"
+  [[ $(stat -c %u -- "$directory") == "$EUID" ]] ||
+    error "untrusted source directory: $directory"
+  mode=$(stat -c %a -- "$directory") || error "cannot stat $directory"
+  (((8#$mode & 0022) == 0)) || error "writable source directory: $directory"
+done
+for source_file in "$checkout/bin/sysbackup" \
+  "$checkout/lib/sysbackup/config-parser"; do
+  trusted_source "$source_file"
+done
+
+# Existing directories are never replaced or made more permissive. This also
+# keeps the local config out of a symlinked checkout or another user's tree.
+for directory in "$account_home" "$account_home/.local" \
+  "$account_home/.local/bin" "$account_home/.config" \
+  "$account_home/.config/sysbackup"; do
+  if [[ ! -e $directory && ! -L $directory ]]; then
+    mkdir -m 0700 -- "$directory" || error "cannot create $directory"
+  fi
+  [[ -d $directory && ! -L $directory ]] || error "unsafe directory: $directory"
+  owner=$(stat -c %u -- "$directory") || error "cannot stat $directory"
+  mode=$(stat -c %a -- "$directory") || error "cannot stat $directory"
+  if [[ $owner != "$EUID" ]] || (((8#$mode & 0022) != 0)); then
+    error "unsafe directory ownership or mode: $directory"
+  fi
+done
+
+command_link=$account_home/.local/bin/sysbackup
+if [[ -e $command_link || -L $command_link ]]; then
+  [[ -L $command_link && $(readlink -- "$command_link") == "$checkout/bin/sysbackup" ]] ||
+    error "refusing to replace $command_link"
+fi
+
+# Preflight every template and destination before exposing the command or
+# creating a config file. A bad late env file must leave a fresh install inert.
+for name in sysbackup.conf sysbackup.env; do
+  source_file=$checkout/examples/$name
+  trusted_source "$source_file"
+  destination=$account_home/.config/sysbackup/$name
+  if [[ -e $destination || -L $destination ]]; then
+    [[ -f $destination && ! -L $destination ]] || error "unsafe config: $destination"
+    [[ $(stat -c %u:%a -- "$destination") == "$EUID:600" ]] ||
+      error "config must belong to this user and have mode 600: $destination"
+  fi
+done
+
+for name in sysbackup.conf sysbackup.env; do
+  destination=$account_home/.config/sysbackup/$name
+  [[ -e $destination ]] && continue
+  install -m 0600 -- "$checkout/examples/$name" "$destination"
+done
+[[ -e $command_link || -L $command_link ]] ||
+  ln -s -- "$checkout/bin/sysbackup" "$command_link"
+printf 'Installed %s\n' "$command_link"

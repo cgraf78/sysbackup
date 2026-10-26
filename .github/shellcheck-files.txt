@@ -1,10 +1,11 @@
 # type<TAB>repository-relative path
-program	config-parser
+program	lib/sysbackup/config-parser
 program	install
-program	sysbackup
+program	bin/sysbackup
 program	test/config-parser-test
 program	test/install-test
 program	test/lib.sh
 program	test/mount-test
+program	test/per-user-test
 program	test/parent-snapshot-test
 program	test/success-marker-test

@@ -1,15 +1,31 @@
 #!/bin/bash
 
-# Enable error handling
 set -e
+umask 077
 
-# Init paths
-declare -r confDir="/etc/sysbackup"
+accountEntry=$(getent passwd "$EUID") || {
+  echo "Error: Cannot resolve the effective user's home" >&2
+  exit 1
+}
+IFS=: read -r _ _ accountUid _ _ accountHome _ <<<"$accountEntry"
+[[ $accountUid == "$EUID" && $accountHome == /* && $accountHome != / ]] || {
+  echo "Error: Unsafe account home" >&2
+  exit 1
+}
+export HOME=$accountHome
+scriptFile=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
+repoRoot=$(cd -- "$(dirname -- "$scriptFile")/.." && pwd -P) || exit 1
+
+# Use the account database, rather than a caller-supplied HOME, for privileged
+# invocations. Code follows the executable's checkout while local data follows
+# the effective user. The latter never belongs in a source repository.
+declare -r accountHome repoRoot
+declare -r confDir="$accountHome/.config/sysbackup"
 declare -r confFile="$confDir/sysbackup.conf"
 declare -r envFile="$confDir/sysbackup.env"
-declare -r lockDir="/var/lock/sysbackup"
-declare -r lockFile="$lockDir/sysbackup.lock"
-declare -r stateDir="/var/lib/sysbackup"
+declare -r parserFile="$repoRoot/lib/sysbackup/config-parser"
+declare -r stateDir="$accountHome/.local/state/sysbackup"
+declare -r lockFile="$stateDir/sysbackup.lock"
 declare -r successFile="$stateDir/last-success"
 
 # print_usage - Prints the command usage info
@@ -92,19 +108,46 @@ select_repo_config() {
 #
 ####################################
 
-# Require root
-if [ $EUID -ne 0 ]; then
-  error "This script must be run as root"
-fi
+# The parser and both config files contain executable shell. The active user
+# must own them, and no other account may replace a directory on their path.
+trusted_ancestors() {
+  local target=$1 current owner mode physical
+  physical=$(realpath -e -- "$target") || error "Cannot resolve $target"
+  [ "$physical" = "$target" ] || error "Symlinked or noncanonical directory: $target"
+  current=$target
+  while :; do
+    [ -d "$current" ] && [ ! -L "$current" ] || error "Unsafe directory: $current"
+    owner=$(stat -c %u -- "$current") || error "Cannot stat $current"
+    mode=$(stat -c %a -- "$current") || error "Cannot stat $current"
+    [ "$owner" = 0 ] || [ "$owner" = "$EUID" ] ||
+      error "Directory has an untrusted owner: $current"
+    # /tmp and /var/tmp are safe ancestors only when the sticky bit prevents
+    # another user from replacing this account-owned child directory.
+    if (((8#$mode & 0022) != 0 && (8#$mode & 01000) == 0)); then
+      error "Directory is writable by another user: $current"
+    fi
+    [ "$current" = / ] && break
+    current=${current%/*}
+    [ -n "$current" ] || current=/
+  done
+}
 
-# The parser and both config files contain executable shell. Check their
-# trust boundary before sourcing or evaluating any of them.
+trusted_dir() {
+  local dir=$1 owner mode
+  [ -d "$dir" ] && [ ! -L "$dir" ] || error "Unsafe directory: $dir"
+  owner=$(stat -c %u -- "$dir") || error "Cannot stat $dir"
+  mode=$(stat -c %a -- "$dir") || error "Cannot stat $dir"
+  if [ "$owner" != "$EUID" ] || (((8#$mode & 0022) != 0)); then
+    error "Directory is writable by another user or not owned by this user: $dir"
+  fi
+}
+
 trusted_file() {
   local path=$1 expected=${2:-} owner mode
   [ -f "$path" ] && [ ! -L "$path" ] || error "Unsafe configuration file: $path"
   owner=$(stat -c %u -- "$path") || error "Cannot stat $path"
   mode=$(stat -c %a -- "$path") || error "Cannot stat $path"
-  [ "$owner" = 0 ] || error "Configuration file must be owned by root: $path"
+  [ "$owner" = "$EUID" ] || error "File must be owned by the effective user: $path"
   if [ -n "$expected" ]; then
     [ "$mode" = "$expected" ] || error "Configuration file must have mode $expected: $path"
   else
@@ -112,20 +155,22 @@ trusted_file() {
   fi
 }
 
-[ -d "$confDir" ] && [ ! -L "$confDir" ] || error "Unsafe configuration directory: $confDir"
-confDirOwner=$(stat -c %u -- "$confDir") || error "Cannot stat $confDir"
-confDirMode=$(stat -c %a -- "$confDir") || error "Cannot stat $confDir"
-if [ "$confDirOwner" != 0 ] || (((8#$confDirMode & 0022) != 0)); then
-  error "Unsafe configuration directory: $confDir"
-fi
-trusted_file "$confDir/config-parser"
-trusted_file "$confFile"
+trusted_ancestors "$accountHome"
+trusted_ancestors "$repoRoot"
+trusted_dir "$accountHome"
+trusted_dir "$accountHome/.config"
+trusted_dir "$confDir"
+trusted_dir "$repoRoot"
+trusted_dir "$repoRoot/lib"
+trusted_dir "$repoRoot/lib/sysbackup"
+trusted_file "$parserFile"
+trusted_file "$confFile" 600
 trusted_file "$envFile" 600
 
 # The sourced parser fills this array with section names.
 declare -a cfg_sections=()
 # shellcheck source=/dev/null
-source "$confDir/config-parser"
+source "$parserFile"
 # Init environment vars
 # shellcheck source=/dev/null
 source "$envFile"
@@ -236,23 +281,24 @@ fi
 # this process's claim, while inherited child descriptors keep it held.
 successTmp=
 mountDir=
-# /run/lock is world-writable on some hosts. A private, root-owned directory
-# prevents another user from planting a symlink at the lock pathname. Its
-# parent must be non-writable or sticky, so the directory cannot be replaced.
-lockParent=${lockDir%/*}
-lockParentOwner=$(stat -L -c %u -- "$lockParent") || error "Cannot stat lock parent"
-lockParentMode=$(stat -L -c %a -- "$lockParent") || error "Cannot stat lock parent"
-if [ "$lockParentOwner" != 0 ] || (((8#$lockParentMode & 0022) != 0 && (8#$lockParentMode & 01000) == 0)); then
-  error "Unsafe lock parent"
+# The state directory also protects the lock name from another user. Do not
+# follow a symlink at any directory boundary before opening the lock file.
+for stateParent in "$accountHome/.local" "$accountHome/.local/state" "$stateDir"; do
+  if [ ! -e "$stateParent" ] && [ ! -L "$stateParent" ]; then
+    mkdir -m 0700 -- "$stateParent" || error "Cannot create state directory"
+  fi
+  trusted_dir "$stateParent"
+done
+stateMode=$(stat -c %a -- "$stateDir") || error "Cannot stat state directory"
+# A monitor can receive execute-only access through a named-user ACL. Linux
+# exposes its ACL mask as group execute in stat's mode, so allow 0710 as well
+# as 0700, while forbidding group read/write and all other-user access.
+if (((8#$stateMode & 0700) != 0700 || (8#$stateMode & 0067) != 0)); then
+  error "State directory must be private (mode 700 or 710)"
 fi
-if [ ! -e "$lockDir" ] && [ ! -L "$lockDir" ]; then
-  mkdir -m 0700 -- "$lockDir" || error "Cannot create lock directory"
-fi
-[ -d "$lockDir" ] && [ ! -L "$lockDir" ] || error "Unsafe lock directory"
-lockDirOwner=$(stat -c %u -- "$lockDir") || error "Cannot stat lock directory"
-lockDirMode=$(stat -c %a -- "$lockDir") || error "Cannot stat lock directory"
-[ "$lockDirOwner" = 0 ] && [ "$lockDirMode" = 700 ] || error "Unsafe lock directory"
-exec {lockFd}>"$lockFile"
+[ ! -L "$lockFile" ] || error "Unsafe lock file"
+if [ -e "$lockFile" ]; then trusted_file "$lockFile"; fi
+exec {lockFd}>>"$lockFile"
 trap exit_handler EXIT
 flock -n "$lockFd" || error "Script already running"
 
@@ -301,7 +347,7 @@ for repoIndex in "${!repos[@]}"; do
 
     # Perform mount
   elif [ "$command" = mount ]; then
-    mountDir=$(mktemp -d /mnt/sysbackup.XXXXXXXX)
+    mountDir=$(mktemp -d "$stateDir/mount.XXXXXXXX")
     echo "Mounting repository at $mountDir"
     restic mount "${options[@]}" "$mountDir"
     rmdir -- "$mountDir"
@@ -338,16 +384,13 @@ done
 # the next run refreshes it; the finish time only adds the change in duration
 # from one night to the next.
 #
-# Modes are explicit so the unprivileged monitoring agent can read the marker
-# under any umask, and the rename keeps readers from seeing a partly written
-# file. An existing state directory keeps its mode: if someone tightened it,
-# the agent can no longer stat the marker, its items go unsupported, and
-# monitoring alerts on the missing data instead of the script loosening it.
+# The file is readable to a monitor given access through the account's home;
+# the private state directory still controls traversal. Rename keeps readers
+# from seeing a partly written file.
 if [ "$command" = backup ]; then
-  [ -d "$stateDir" ] || install -d -m 0755 "$stateDir"
   successTmp=$(mktemp "$stateDir/.last-success.XXXXXX")
   printf 'repo%s\n' "${!repos[@]}" >"$successTmp"
   chmod 0644 "$successTmp"
-  mv -f "$successTmp" "$successFile"
+  mv -fT -- "$successTmp" "$successFile"
   successTmp=
 fi

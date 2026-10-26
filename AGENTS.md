@@ -2,24 +2,27 @@
 
 ## About
 
-`sysbackup` is a Linux-only Bash wrapper around Restic. It runs as root and
-reads root-owned configuration, so changes to parsing, installation, locking,
+`sysbackup` is a Linux-only Bash wrapper around Restic. It reads the effective
+user's private configuration, so changes to parsing, installation, locking,
 or success markers need tests that cannot reach a real repository.
 
 ## Layout
 
-- `sysbackup`: command dispatch, repository operations, locking, and the
+- `bin/sysbackup`: command dispatch, repository operations, locking, and the
   success marker.
-- `config-parser`: the project-owned parser for the trusted INI-style config.
-- `install` and `install.recipe`: root installer and its file manifest.
+- `lib/sysbackup/config-parser`: the project-owned parser for the trusted
+  INI-style config.
+- `install`: standalone checkout-backed installer for the effective user.
 - `examples/`: generic config and environment templates; never add secrets.
 - `test/`: parser tests plus root-isolated fake-Restic integration suites.
 
 ## Invariants
 
 - The parser evaluates assignment values as shell code only after `sysbackup`
-  verifies the config directory and files are root-owned and protected from
-  non-root writes. Preserve that trust boundary.
+  verifies the config directory and files belong to the effective user and
+  are protected from other users' writes. Preserve that trust boundary.
+- Config and credentials belong under `~/.config/sysbackup`; the lock,
+  temporary mount, and success marker belong under `~/.local/state/sysbackup`.
 - Repository sections start at `repo0`, are contiguous, and name distinct
   locations. A malformed or omitted repo must not refresh the success marker.
 - A backup writes the marker only after every configured repository succeeds
@@ -29,10 +32,10 @@ or success markers need tests that cannot reach a real repository.
 
 ## Testing
 
-- Run `bash test/config-parser-test`, then all four root suites named in the
-  README, plus ShellCheck and `bash -n` over the shell inventory.
-- Root suites re-exec in a private mount namespace, overlay `/etc/sysbackup`,
-  `/var/lib`, `/mnt`, and the lock directory with tmpfs, and refuse to run
+- Run the config-parser, installer, and ordinary-user suites, then the three
+  root suites named in the README, plus ShellCheck and `bash -n`.
+- Root suites re-exec in a private mount namespace, overlay the effective
+  user's home and test-only fake-Restic location with tmpfs, and refuse to run
   unless Restic resolves to a fake executable. Never weaken those guards.
 - CI runs on Linux only because the root suites require mount namespaces.
   `.github/shellcheck-files.txt` lists shell programs; CI separately lints
