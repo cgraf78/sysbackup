@@ -28,6 +28,9 @@ jobs:
       - uses: cgraf78/actions/.github/actions/shellcheck-inventory@6ecbf5dafaeb9483aeeba3915321544b31572172
         with:
           inventory-path: .github/shellcheck-files.txt
+          # Existing guard clauses are intentionally fatal on any false term;
+          # test predicates are invoked indirectly by the harness.
+          exclude-codes: SC2015,SC2317
 
       - name: Check Bash syntax
         shell: bash
