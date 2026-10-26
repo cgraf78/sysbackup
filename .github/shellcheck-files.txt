@@ -1,0 +1,10 @@
+# type<TAB>repository-relative path
+program	config-parser
+program	install
+program	sysbackup
+program	test/config-parser-test
+program	test/install-test
+program	test/lib.sh
+program	test/mount-test
+program	test/parent-snapshot-test
+program	test/success-marker-test

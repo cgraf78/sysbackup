@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "America/Chicago"
+    # Shared-action pins form one generated family owned by its lock.
+    ignore:
+      - dependency-name: "cgraf78/actions"

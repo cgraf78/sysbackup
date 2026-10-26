@@ -1,0 +1,199 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR disable=SC2329
+#
+# success-marker-test - Verifies the /var/lib/sysbackup/last-success marker.
+#
+# Monitoring alerts when the marker is missing, stale, or lists fewer repos
+# than expected, so the marker must change only after every repo backs up,
+# forgets, and prunes cleanly, must list exactly the repos that ran, and must
+# stay readable by an unprivileged agent.
+#
+# Must run as root; see lib.sh for how host state stays untouched.
+#
+# Usage: sudo test/success-marker-test
+
+# shellcheck source=lib.sh disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+declare -r marker=/var/lib/sysbackup/last-success
+
+# Predicates below are passed to check by name, which ShellCheck cannot
+# see; the file-level SC2329 directive above covers them.
+
+has_marker() { [ -e "$marker" ]; }
+no_marker() { [ ! -e "$marker" ]; }
+lists() { [ "$(tr '\n' ' ' <"$marker")" = "$1" ]; }
+calls() { tr '\n' ' ' <"$CALLS"; }
+modes() { [ "$(stat -c %a /var/lib/sysbackup) $(stat -c %a "$marker")" = "755 644" ]; }
+no_temp_files() { has_marker && [ -z "$(find /var/lib/sysbackup -name '.last-success.*')" ]; }
+failed_without_marker() { [ "$rc" != 0 ] && no_marker; }
+stamped_at_finish() { [ "$stamp" -ge $((start + 2)) ] && [ "$stamp" -le "$end" ]; }
+dir_mode_kept() { has_marker && [ "$(stat -c %a /var/lib/sysbackup)" = 700 ]; }
+
+reset
+run "" backup
+rc=$?
+check "success exits 0" [ $rc = 0 ]
+check "success writes the marker" has_marker
+check "marker lists every repo section" lists "repo0 repo1 "
+check "marker and state dir are world-readable" modes
+check "no temporary marker files left" no_temp_files
+check "success runs every step on every repo" \
+  [ "$(calls)" = "snapshots:r0 backup:r0 forget:r0 prune:r0 snapshots:r1 backup:r1 forget:r1 prune:r1 " ]
+
+reset
+(umask 077 && run "" backup)
+check "restrictive umask still leaves the marker readable" modes
+
+# The marker carries the run's finish time, so monitoring sees only the
+# night-to-night change in run time, not the run time itself.
+reset
+start=$(date +%s)
+SLEEP=1 run "" backup
+end=$(date +%s)
+stamp=$(stat -c %Y "$marker")
+check "marker is stamped when the run finishes" stamped_at_finish
+
+# An existing state directory keeps its mode; the script never loosens it.
+reset
+mkdir -m 700 /var/lib/sysbackup
+run "" backup
+check "an existing state directory keeps its mode" dir_mode_kept
+
+for spec in snapshots:r0 snapshots:r1 backup:r0 forget:r0 prune:r0 backup:r1 forget:r1 prune:r1; do
+  reset
+  run "$spec" backup
+  rc=$?
+  check "failing $spec exits nonzero" [ $rc != 0 ]
+  check "failing $spec leaves no marker" no_marker
+done
+
+reset
+run backup:r0 backup
+check "a failure in the first repo skips the second" \
+  [ "$(calls)" = "snapshots:r0 backup:r0 " ]
+
+for cmd in init stats unlock snapshots prune; do
+  reset
+  run "" "$cmd"
+  check "$cmd command leaves no marker" no_marker
+done
+
+reset
+run "" backup -r r0
+rc=$?
+check "backup -r is refused without a marker" failed_without_marker
+
+reset
+hold_lock
+run "" backup
+rc=$?
+release_lock
+check "an already-running backup leaves no marker" failed_without_marker
+
+# A failed run must not refresh an existing marker, or a stale backup would
+# look fresh to monitoring.
+reset
+mkdir -p /var/lib/sysbackup
+printf 'repo0\nrepo1\n' >"$marker"
+touch -d '2 days ago' "$marker"
+old=$(stat -c %Y "$marker")
+run prune:r1 backup
+check "a failed run keeps an existing marker stale" \
+  [ "$(stat -c %Y "$marker")" = "$old" ]
+
+reset
+mkdir -p /var/lib/sysbackup
+touch -d '2 days ago' "$marker"
+run "" backup
+check "a successful run refreshes a stale marker" \
+  [ $(($(date +%s) - $(stat -c %Y "$marker"))) -lt 60 ]
+
+# A repo missing from the run must show in the marker so monitoring can catch
+# it, whether the section is gone or fails to parse.
+reset
+config '[global]' 'INCLUDES="/etc"' '' '[repo0]' 'REPO="r0"'
+run "" backup
+check "a one-repo config lists only that section" lists "repo0 "
+
+reset
+config '[global]' 'INCLUDES="/etc"' '' '[repo0]' 'REPO="r0"' '' '[repo1]' 'REPO="r1'
+run "" backup
+rc=$?
+check "malformed config fails without a marker" failed_without_marker
+check "malformed config never calls restic" [ ! -s "$CALLS" ]
+
+reset
+config '[global]' 'INCLUDES="/etc"' '' '[repo0]' 'REPO="r0"' '' '[repo2]' 'REPO="r2"'
+run "" backup
+rc=$?
+check "a section gap fails without a marker" failed_without_marker
+check "a section gap never calls restic" [ ! -s "$CALLS" ]
+
+reset
+config '[global]' 'INCLUDES="/etc"' '' '[repo0]' 'REPO="r0"' '' '[unused]'
+run "" backup
+rc=$?
+check "an unknown section fails without a marker" failed_without_marker
+check "an unknown section never calls restic" [ ! -s "$CALLS" ]
+
+reset
+config '[global]' 'INCLUDES="/etc"' '' '[repo0]' 'REPO="r0"' 'INCLUDES="/first"' '' '[repo1]' 'REPO="r0"' 'INCLUDES="/second"'
+run "" backup
+rc=$?
+check "duplicate repo locations fail without a marker" failed_without_marker
+check "duplicate repo locations never call restic" [ ! -s "$CALLS" ]
+
+reset
+printf 'touch "%s"\n' "$T/untrusted-ran" >/etc/sysbackup/sysbackup.env
+chmod 666 /etc/sysbackup/sysbackup.env
+run "" backup
+rc=$?
+check "unsafe environment fails before execution" failed_without_marker
+check "unsafe environment code never runs" [ ! -e "$T/untrusted-ran" ]
+check "unsafe environment never calls restic" [ ! -s "$CALLS" ]
+chmod 600 /etc/sysbackup/sysbackup.env
+: >/etc/sysbackup/sysbackup.env
+
+reset
+chmod 666 /etc/sysbackup/sysbackup.conf
+run "" backup
+rc=$?
+check "writable config fails before parsing" failed_without_marker
+check "writable config never calls restic" [ ! -s "$CALLS" ]
+chmod 644 /etc/sysbackup/sysbackup.conf
+
+reset
+# shellcheck disable=SC2154 # Set by the sourced test harness.
+chmod 0777 "$lockDir"
+run "" backup
+rc=$?
+check "non-sticky writable lock parent is refused" failed_without_marker
+check "unsafe lock parent never calls restic" [ ! -s "$CALLS" ]
+chmod 1777 "$lockDir"
+
+reset
+# shellcheck disable=SC2154 # Set by the sourced test harness.
+[ -d "$lockDir/sysbackup" ] || mkdir -m 0700 "$lockDir/sysbackup"
+chmod 0777 "$lockDir/sysbackup"
+run "" backup
+rc=$?
+check "writable lock directory is refused" failed_without_marker
+check "writable lock directory never calls restic" [ ! -s "$CALLS" ]
+chmod 0700 "$lockDir/sysbackup"
+
+# An opened lock descriptor must still refer to the lock used by future
+# invocations after a successful run.
+reset
+# shellcheck disable=SC2154 # Set by the sourced test harness.
+exec 98>"$lockDir/sysbackup/sysbackup.lock"
+run "" backup
+flock -x 98
+: >"$CALLS"
+run "" backup
+rc=$?
+check "lock inode remains authoritative across runs" [ "$rc" != 0 ]
+check "retained lock blocks every restic operation" [ ! -s "$CALLS" ]
+release_lock
+
+finish

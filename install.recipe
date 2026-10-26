@@ -1,0 +1,8 @@
+# Installation Recipe
+#
+# Format:
+#   src file:dst dir:permissions:options {nooverwrite}
+sysbackup:/usr/bin:755
+config-parser:/etc/sysbackup:644
+examples/sysbackup.conf:/etc/sysbackup:644:nooverwrite
+examples/sysbackup.env:/etc/sysbackup:600:nooverwrite

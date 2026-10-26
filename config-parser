@@ -1,0 +1,50 @@
+# shellcheck shell=bash
+# Parse the small INI dialect used by sysbackup. This implementation belongs
+# to this project; no third-party parser code is included.
+
+declare -A cfg_lines=()
+
+cfg_parse() {
+  local config_file=$1 line section='' entry
+  cfg_sections=()
+  cfg_lines=()
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    # The original config format uses semicolons for whole-line and trailing
+    # comments. Removing them before parsing keeps existing templates valid.
+    entry=${line%%;*}
+    entry=${entry#"${entry%%[![:space:]]*}"}
+    entry=${entry%"${entry##*[![:space:]]}"}
+    [ -n "$entry" ] || continue
+
+    if [[ $entry =~ ^\[([[:alpha:]_][[:alnum:]_]*)\]$ ]]; then
+      section=${BASH_REMATCH[1]}
+      [ -z "${cfg_lines[$section]+set}" ] || return 1
+      cfg_sections+=("$section")
+      cfg_lines[$section]=
+    elif [[ $entry =~ ^[[:alpha:]_][[:alnum:]_]*[[:space:]]*= ]]; then
+      [ -n "$section" ] || return 1
+      cfg_lines[$section]+="$entry"$'\n'
+    else
+      return 1
+    fi
+  done <"$config_file"
+}
+
+cfg_has() {
+  [ -n "${cfg_lines[$1]+set}" ]
+}
+
+cfg_apply() {
+  local section=$1 entry key value
+  cfg_has "$section" || return 1
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    [[ $entry =~ ^([[:alpha:]_][[:alnum:]_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || return 1
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    # Values are shell-style word lists in the trusted root-owned config.
+    # Evaluate only after the caller has checked its owner and permissions.
+    eval "$key=($value)" || return 1
+  done <<<"${cfg_lines[$section]}"
+}

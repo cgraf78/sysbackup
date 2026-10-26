@@ -1,0 +1,40 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# parent-snapshot-test - Verifies that each repo's backup gets only its own
+# newest snapshot as --parent.
+#
+# backup options used to accumulate across repos, so the second repo also got
+# the first repo's --parent. With no snapshots of its own, restic would be
+# handed a snapshot ID from another repo and fail.
+#
+# Must run as root; see lib.sh for how host state stays untouched.
+#
+# Usage: sudo test/parent-snapshot-test
+
+# shellcheck source=lib.sh disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+parents() { tr '\n' ' ' <"$PARENTS"; }
+
+reset
+PARENT_r0=aaaa1111 PARENT_r1=bbbb2222 run "" backup
+check "each repo gets its own parent" [ "$(parents)" = "r0:aaaa1111 r1:bbbb2222 " ]
+
+reset
+PARENT_r0=aaaa1111 OLDER_r0=cccc3333 run "" backup
+check "newest JSON snapshot is selected" [ "$(parents)" = "r0:aaaa1111 r1:none " ]
+
+reset
+PARENT_r0=aaaa1111 run "" backup
+check "a repo without snapshots gets no parent" [ "$(parents)" = "r0:aaaa1111 r1:none " ]
+
+reset
+PARENT_r1=bbbb2222 run "" backup
+check "only the repo with snapshots gets a parent" [ "$(parents)" = "r0:none r1:bbbb2222 " ]
+
+reset
+run "" backup
+check "no snapshots means no parent" [ "$(parents)" = "r0:none r1:none " ]
+
+finish

@@ -1,0 +1,4 @@
+# Local copies may contain backup locations and credentials. Install from the
+# generic templates in examples/; never track machine-specific files here.
+/sysbackup.conf
+/sysbackup.env

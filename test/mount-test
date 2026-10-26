@@ -1,0 +1,35 @@
+#!/bin/bash
+# Mount paths are invocation-owned and are removed after Restic returns or
+# fails. /mnt is overlaid by the shared private mount-namespace harness.
+# shellcheck source=lib.sh disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+declare -r location='sftp:example:/nested/backup'
+
+# These predicates are passed to the shared check helper by name.
+# shellcheck disable=SC2329
+no_mountpoints() { [ -z "$(ls -A /mnt)" ]; }
+# shellcheck disable=SC2329
+private_mount() {
+  local arg
+  [ -s "$ARGS" ] || return 1
+  while IFS= read -r arg; do
+    [ "$arg" = --allow-other ] && return 1
+  done <"$ARGS"
+  return 0
+}
+
+reset
+run "" mount -r "$location"
+rc=$?
+check "mount succeeds with a nested repo location" [ "$rc" = 0 ]
+check "mount does not allow other local users" private_mount
+check "successful mount removes its directory" no_mountpoints
+
+reset
+run "mount:$location" mount -r "$location"
+rc=$?
+check "failed mount exits nonzero" [ "$rc" != 0 ]
+check "failed mount removes its directory" no_mountpoints
+
+finish

@@ -1,0 +1,86 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Stagger maintenance checks across sibling repositories.
+    - cron: "53 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
+        with:
+          persist-credentials: false
+
+      - uses: cgraf78/actions/.github/actions/shellcheck-inventory@6ecbf5dafaeb9483aeeba3915321544b31572172
+        with:
+          inventory-path: .github/shellcheck-files.txt
+
+      - name: Check Bash syntax
+        shell: bash
+        run: |-
+          set -euo pipefail
+          # This sourced template intentionally has no executable shebang, so
+          # lint it explicitly outside the shell-program inventory.
+          shellcheck -s bash examples/sysbackup.env
+          bash -n sysbackup install config-parser examples/sysbackup.env test/lib.sh test/*-test
+
+      - name: Test configuration parser
+        shell: bash
+        run: bash test/config-parser-test
+
+      - name: Test backup and installer in isolated mount namespaces
+        shell: bash
+        run: |-
+          set -euo pipefail
+          # The harness refuses to create a host path before mounting tmpfs.
+          # This directory is created only on the disposable CI runner.
+          sudo -n install -d -o root -g root -m 0755 /etc/sysbackup
+          for suite in parent-snapshot-test success-marker-test install-test mount-test; do
+            sudo -n bash "test/$suite"
+          done
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs: [linux]
+    runs-on: ubuntu-24.04
+    env:
+      LINUX_RESULT: ${{ needs.linux.result }}
+    steps:
+      - name: Require Linux tests
+        shell: bash
+        run: |-
+          printf 'Linux tests: %s\n' "$LINUX_RESULT"
+          test "$LINUX_RESULT" = success
+
+  actions-sync:
+    name: cgraf78/actions sync
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
+        with:
+          persist-credentials: false
+
+      # GitHub resolves literal refs before the job reads repository files;
+      # this verifies they still match the one reviewed lock.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@6ecbf5dafaeb9483aeeba3915321544b31572172

@@ -1,0 +1,68 @@
+#!/bin/bash
+set -e
+
+scriptDir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
+recipeFile="$scriptDir/install.recipe"
+
+error() {
+  echo "Error: $1" >&2
+  exit 1
+}
+
+[ "$EUID" -eq 0 ] || error "This script must be run as root"
+[ -f "$recipeFile" ] || error "No install recipe ($recipeFile)"
+
+sources=() targets=() modes=() options=()
+while IFS= read -r line || [ -n "$line" ]; do
+  line=${line%%#*}
+  [ -n "${line//[[:space:]]/}" ] || continue
+  IFS=: read -r src dst mode option extra <<<"$line"
+  [ -n "$src" ] && [[ "$dst" = /* ]] && [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ -z "$extra" ] || error "Invalid recipe entry"
+  [ -z "$option" ] || [ "$option" = nooverwrite ] || error "Unknown recipe option"
+
+  sourceFile="$scriptDir/$src"
+  target="$dst/$(basename "$src")"
+  [ -f "$sourceFile" ] && [ ! -L "$sourceFile" ] || error "Missing or unsafe source: $sourceFile"
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    [ -d "$dst" ] && [ ! -L "$dst" ] || error "Unsafe destination directory: $dst"
+    dirOwner=$(stat -c %u -- "$dst") || error "Cannot stat $dst"
+    dirMode=$(stat -c %a -- "$dst") || error "Cannot stat $dst"
+    if [ "$dirOwner" != 0 ] || (((8#$dirMode & 0022) != 0)); then
+      error "Unsafe destination directory: $dst"
+    fi
+  fi
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || error "Unsafe destination file: $target"
+  fi
+  sources+=("$sourceFile") targets+=("$target") modes+=("$mode") options+=("$option")
+done <"$recipeFile"
+
+# Finish validation before replacing any installed file. A missing late
+# template must not leave a half-upgraded executable and parser behind.
+[ "${#sources[@]}" -gt 0 ] || error "Empty install recipe"
+
+# New directory components must not inherit a permissive caller umask.
+umask 022
+
+tempFile=
+cleanup() {
+  if [ -n "$tempFile" ]; then rm -f -- "$tempFile"; fi
+}
+trap cleanup EXIT
+
+for i in "${!sources[@]}"; do
+  target=${targets[i]}
+  if [ "${options[i]}" = nooverwrite ] && [ -e "$target" ]; then
+    chown root:root -- "$target"
+    chmod "${modes[i]}" -- "$target"
+    continue
+  fi
+
+  mkdir -p -- "$(dirname "$target")"
+  # mktemp starts mode 0600, so a credential template is never briefly
+  # readable under a permissive caller umask. Rename replaces atomically.
+  tempFile=$(mktemp "$(dirname "$target")/.sysbackup-install.XXXXXXXX")
+  install -o root -g root -m "${modes[i]}" -- "${sources[i]}" "$tempFile"
+  mv -fT -- "$tempFile" "$target"
+  tempFile=
+done

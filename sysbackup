@@ -1,0 +1,353 @@
+#!/bin/bash
+
+# Enable error handling
+set -e
+
+# Init paths
+declare -r confDir="/etc/sysbackup"
+declare -r confFile="$confDir/sysbackup.conf"
+declare -r envFile="$confDir/sysbackup.env"
+declare -r lockDir="/var/lock/sysbackup"
+declare -r lockFile="$lockDir/sysbackup.lock"
+declare -r stateDir="/var/lib/sysbackup"
+declare -r successFile="$stateDir/last-success"
+
+# print_usage - Prints the command usage info
+print_usage() {
+  echo "Usage:"
+  echo "$0 <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "    backup        Backs up data on the system"
+  echo "    init          Initializes a new backup repo"
+  echo "    mount         Mounts the repo"
+  echo "    unlock        Unlocks the repo"
+  echo "    prune         Prune repo data"
+  echo "    stats         Basic repo stats"
+  echo "    snapshots     List snapshots in repo"
+  echo ""
+  echo "Options:"
+  echo "    -h            Displays this help"
+  echo "    -r <repo>     Uses the specified repo"
+  echo ""
+  echo "Examples:"
+  echo "    $0 backup"
+  echo "    $0 init"
+  echo "    $0 mount -r b2:bucketname:mydir"
+  echo "    $0 prune"
+  echo "    $0 stats"
+  echo "    $0 snapshots"
+}
+
+# exit_handler - Cleans up resources we created.
+exit_handler() {
+  local status=$?
+  trap - EXIT
+  if [ -n "${mountDir:-}" ]; then
+    rmdir -- "$mountDir" || echo "Warning: could not remove temporary mount directory" >&2
+  fi
+  if [ -n "${successTmp:-}" ]; then
+    rm -f -- "$successTmp" || echo "Warning: could not remove temporary marker" >&2
+  fi
+  # Keep the lock pathname: unlinking it lets a waiting process and a new
+  # process lock different inodes. Children may also hold the open descriptor.
+  exec {lockFd}>&- || true
+  exit "$status"
+}
+
+# error - Report error and exit
+# $1 - Error string
+error() {
+  echo "Error: $1" >&2
+  exit 1
+}
+
+# clear_repo_config - Clears vars that are associated with repo config
+clear_repo_config() {
+  unset REPO
+  unset INCLUDES
+  unset EXCLUDES
+}
+
+# select_repo_config - Selects the config for the specified repo
+#     $1 - repo
+select_repo_config() {
+  local desiredRepo=$1
+  local curRepo=
+  local i=0
+  clear_repo_config
+  REPO=$desiredRepo
+  for curRepo in "${confFileRepos[@]}"; do
+    if [ "$curRepo" = "$desiredRepo" ]; then
+      cfg_apply "repo$i" || error "Could not apply repo$i configuration"
+      break
+    fi
+    i=$((i + 1))
+  done
+}
+
+####################################
+#
+#  Main script starts here
+#
+####################################
+
+# Require root
+if [ $EUID -ne 0 ]; then
+  error "This script must be run as root"
+fi
+
+# The parser and both config files contain executable shell. Check their
+# trust boundary before sourcing or evaluating any of them.
+trusted_file() {
+  local path=$1 expected=${2:-} owner mode
+  [ -f "$path" ] && [ ! -L "$path" ] || error "Unsafe configuration file: $path"
+  owner=$(stat -c %u -- "$path") || error "Cannot stat $path"
+  mode=$(stat -c %a -- "$path") || error "Cannot stat $path"
+  [ "$owner" = 0 ] || error "Configuration file must be owned by root: $path"
+  if [ -n "$expected" ]; then
+    [ "$mode" = "$expected" ] || error "Configuration file must have mode $expected: $path"
+  else
+    (((8#$mode & 0022) == 0)) || error "Configuration file is writable by another user: $path"
+  fi
+}
+
+[ -d "$confDir" ] && [ ! -L "$confDir" ] || error "Unsafe configuration directory: $confDir"
+confDirOwner=$(stat -c %u -- "$confDir") || error "Cannot stat $confDir"
+confDirMode=$(stat -c %a -- "$confDir") || error "Cannot stat $confDir"
+if [ "$confDirOwner" != 0 ] || (((8#$confDirMode & 0022) != 0)); then
+  error "Unsafe configuration directory: $confDir"
+fi
+trusted_file "$confDir/config-parser"
+trusted_file "$confFile"
+trusted_file "$envFile" 600
+
+# The sourced parser fills this array with section names.
+declare -a cfg_sections=()
+# shellcheck source=/dev/null
+source "$confDir/config-parser"
+# Init environment vars
+# shellcheck source=/dev/null
+source "$envFile"
+
+# Parse command
+if [ $# -eq 0 ]; then
+  print_usage
+  error "No command specified"
+else
+  case "$1" in
+    help | -h)
+      print_usage
+      exit 0
+      ;;
+    backup | init | mount | unlock | prune | stats | snapshots)
+      command=$1
+      shift
+      ;;
+    *)
+      print_usage
+      error "Unknown command"
+      ;;
+  esac
+fi
+
+# Parse options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r)
+      shift
+      if [ -n "$1" ]; then
+        repo=$1
+        shift
+      else
+        error "No repo specified"
+      fi
+      ;;
+    *)
+      print_usage
+      error "Unknown option"
+      ;;
+  esac
+done
+
+# Validate params
+if [ "$command" = mount ]; then
+  if [ -z "$repo" ]; then
+    error "Must specify a repo with the mount command"
+  fi
+fi
+
+if [ "$command" = backup ]; then
+  if [ -n "$repo" ]; then
+    error "Cannot specify a repo with the backup command"
+  fi
+fi
+
+# Parse every section before operating on a repository, so malformed config
+# cannot produce a partial backup and a misleading success marker.
+cfg_parse "$confFile" || error "Could not parse configuration"
+
+# Load & validate config
+cfg_has global || error "Global section not defined"
+unset INCLUDES EXCLUDES
+cfg_apply global || error "Could not apply global configuration"
+[ -z "$INCLUDES" ] && error "INCLUDES not defined. Check config file."
+gIncludes=("${INCLUDES[@]}")
+[ -n "$EXCLUDES" ] && gExcludes=("${EXCLUDES[@]/#/--exclude=}")
+confFileRepos=()
+i=0
+while true; do
+  cfg_has "repo$i" || break
+  clear_repo_config
+  cfg_apply "repo$i" || error "Could not apply repo$i configuration"
+  if [ -z "$REPO" ]; then
+    error "REPO not defined in repo$i. Check config."
+  fi
+  for configuredRepo in "${confFileRepos[@]}"; do
+    [ "$configuredRepo" != "$REPO" ] || error "Duplicate repository location in config"
+  done
+  confFileRepos+=("$REPO")
+  i=$((i + 1))
+done
+
+# A gap such as repo0/repo2 must not silently omit repo2 and refresh the
+# success marker for only a prefix of the configured repositories.
+for section in "${cfg_sections[@]}"; do
+  [ "$section" = global ] && continue
+  [[ "$section" =~ ^repo(0|[1-9][0-9]*)$ ]] || error "Invalid repository section: $section"
+  ((BASH_REMATCH[1] < i)) || error "Noncontiguous repository sections"
+done
+
+if [ ${#confFileRepos[@]} -eq 0 ]; then
+  error "No repos found. Check config file."
+fi
+
+# Build the list of repos to operate on.  If the user
+# specified a repo, we'll just operate on the one provided
+# by the user.  Otherwise, we'll operate on all repos
+# specified in the config file.
+if [ -n "$repo" ]; then
+  repos=("$repo")
+else
+  repos=("${confFileRepos[@]}")
+fi
+
+# Keep the same inode across invocations. Closing the descriptor releases
+# this process's claim, while inherited child descriptors keep it held.
+successTmp=
+mountDir=
+# /run/lock is world-writable on some hosts. A private, root-owned directory
+# prevents another user from planting a symlink at the lock pathname. Its
+# parent must be non-writable or sticky, so the directory cannot be replaced.
+lockParent=${lockDir%/*}
+lockParentOwner=$(stat -L -c %u -- "$lockParent") || error "Cannot stat lock parent"
+lockParentMode=$(stat -L -c %a -- "$lockParent") || error "Cannot stat lock parent"
+if [ "$lockParentOwner" != 0 ] || (((8#$lockParentMode & 0022) != 0 && (8#$lockParentMode & 01000) == 0)); then
+  error "Unsafe lock parent"
+fi
+if [ ! -e "$lockDir" ] && [ ! -L "$lockDir" ]; then
+  mkdir -m 0700 -- "$lockDir" || error "Cannot create lock directory"
+fi
+[ -d "$lockDir" ] && [ ! -L "$lockDir" ] || error "Unsafe lock directory"
+lockDirOwner=$(stat -c %u -- "$lockDir") || error "Cannot stat lock directory"
+lockDirMode=$(stat -c %a -- "$lockDir") || error "Cannot stat lock directory"
+[ "$lockDirOwner" = 0 ] && [ "$lockDirMode" = 700 ] || error "Unsafe lock directory"
+exec {lockFd}>"$lockFile"
+trap exit_handler EXIT
+flock -n "$lockFd" || error "Script already running"
+
+# Run the command on our repos
+for repoIndex in "${!repos[@]}"; do
+  repo=${repos[repoIndex]}
+  # Select repo & init options
+  select_repo_config "$repo"
+  # gOptions is optional and nothing here sets it, so this is normally empty.
+  # shellcheck disable=SC2154
+  options=("${gOptions[@]}")
+  options+=("-r")
+  options+=("$repo")
+
+  # Perform backup
+  if [ "$command" = backup ]; then
+    echo "Backing up repository $((repoIndex + 1))/${#repos[@]}..."
+    [ -n "$EXCLUDES" ] && EXCLUDES=("${EXCLUDES[@]/#/--exclude=}")
+
+    # Options for the 'backup' command. Start fresh for each repo so one
+    # repo's --parent snapshot ID is never passed to another repo.
+    backupOpts=("--cleanup-cache")
+
+    # Restic returns JSON snapshots newest first, including when --latest 1
+    # yields one snapshot from each host/path group.
+    snapshotJson=$(restic snapshots "${options[@]}" --json --latest 1 --tag sysbackup) || error "Snapshot lookup failed"
+    parentSnapshot=$(jq -er 'if type == "array" and all(.[]; .id | type == "string") then (.[0].id // "") else error("invalid snapshot data") end' <<<"$snapshotJson") || error "Invalid snapshot data"
+    if [ -n "$parentSnapshot" ]; then
+      backupOpts+=("--parent")
+      backupOpts+=("$parentSnapshot")
+    fi
+
+    restic backup "${options[@]}" "${gExcludes[@]}" "${EXCLUDES[@]}" "${gIncludes[@]}" "${INCLUDES[@]}" --tag sysbackup "${backupOpts[@]}"
+    restic forget "${options[@]}" --keep-within-daily 0y1m0d0h --tag sysbackup --group-by host
+    restic prune "${options[@]}"
+
+    # Perform init
+  elif [ "$command" = init ]; then
+    echo "Initializing repository $((repoIndex + 1))/${#repos[@]}..."
+    restic init "${options[@]}"
+
+    # Perform unlock
+  elif [ "$command" = unlock ]; then
+    echo "Unlocking repository $((repoIndex + 1))/${#repos[@]}..."
+    restic unlock "${options[@]}"
+
+    # Perform mount
+  elif [ "$command" = mount ]; then
+    mountDir=$(mktemp -d /mnt/sysbackup.XXXXXXXX)
+    echo "Mounting repository at $mountDir"
+    restic mount "${options[@]}" "$mountDir"
+    rmdir -- "$mountDir"
+    mountDir=
+
+  # Perform prune
+  elif [ "$command" = prune ]; then
+    echo "Pruning repository $((repoIndex + 1))/${#repos[@]}..."
+    restic prune "${options[@]}"
+
+  # Perform stats
+  elif [ "$command" = stats ]; then
+    echo "Repository stats $((repoIndex + 1))/${#repos[@]}..."
+    restic stats "${options[@]}"
+
+  # Perform snapshots
+  elif [ "$command" = snapshots ]; then
+    echo "Repository snapshots $((repoIndex + 1))/${#repos[@]}..."
+    restic snapshots "${options[@]}"
+  fi
+done
+
+# Record a fully successful backup for monitoring, which alerts when the
+# marker is missing, older than about a day, or lists fewer repos than
+# expected. set -e makes a failing restic backup, forget, or prune exit before
+# this point. Listing the repos catches a repo silently dropped from the run,
+# e.g. by a config parse error. It lists config section names (repo0, ...),
+# never repo locations, which can embed credentials and this file is
+# world-readable. Backup always runs every configured repo, in section order,
+# so the array indexes are the section numbers.
+#
+# The marker's mtime is when the run finished. Stamping the start instead
+# would add each run's own duration to the age monitoring sees right before
+# the next run refreshes it; the finish time only adds the change in duration
+# from one night to the next.
+#
+# Modes are explicit so the unprivileged monitoring agent can read the marker
+# under any umask, and the rename keeps readers from seeing a partly written
+# file. An existing state directory keeps its mode: if someone tightened it,
+# the agent can no longer stat the marker, its items go unsupported, and
+# monitoring alerts on the missing data instead of the script loosening it.
+if [ "$command" = backup ]; then
+  [ -d "$stateDir" ] || install -d -m 0755 "$stateDir"
+  successTmp=$(mktemp "$stateDir/.last-success.XXXXXX")
+  printf 'repo%s\n' "${!repos[@]}" >"$successTmp"
+  chmod 0644 "$successTmp"
+  mv -f "$successTmp" "$successFile"
+  successTmp=
+fi
