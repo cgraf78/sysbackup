@@ -6,7 +6,7 @@ if ((EUID == 0)); then
   printf 'SKIP: run this suite as an ordinary user\n'
   exit 0
 fi
-repoDir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
+repoDir=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
 T=$(mktemp -d) || exit 1
 trap 'rm -rf -- "$T"' EXIT
 mkdir -m 0700 "$T/bin" "$T/home-a" "$T/home-b"
