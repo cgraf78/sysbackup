@@ -16,7 +16,7 @@
 
 set -u
 
-repoDir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
+repoDir="$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
 declare -r repoDir
 
 if [ $EUID -ne 0 ]; then

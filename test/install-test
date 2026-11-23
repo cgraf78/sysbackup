@@ -2,7 +2,7 @@
 # A fake account lookup confines standalone installation to a temporary home.
 set -u
 
-repoDir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
+repoDir=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
 T=$(mktemp -d) || exit 1
 trap 'rm -rf -- "$T"' EXIT
 mkdir -m 0700 "$T/home" "$T/bin"
