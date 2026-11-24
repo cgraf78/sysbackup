@@ -25,7 +25,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: cgraf78/actions/.github/actions/shellcheck-inventory@d4db2a438c15513589b57a1d77fb12aaae2a7789
+      - uses: cgraf78/actions/.github/actions/shellcheck-inventory@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           inventory-path: .github/shellcheck-files.txt
           # Existing guard clauses are intentionally fatal on any false term;
@@ -91,4 +91,4 @@ jobs:
 
       # GitHub resolves literal refs before the job reads repository files;
       # this verifies they still match the one reviewed lock.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@d4db2a438c15513589b57a1d77fb12aaae2a7789
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e9922d129ba6d9dc43793247409197b0b07b81c8
